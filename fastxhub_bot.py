@@ -6618,8 +6618,9 @@ def main():
     import socket
     
     # Webhook configuration
-    WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://your-domain.com')
     WEBHOOK_PORT = int(os.getenv('PORT', os.getenv('WEBHOOK_PORT', '8443')))
+    WEBHOOK_PATH = "webhook"
+    WEBHOOK_URL = f"https://slvk.shop:{WEBHOOK_PORT}/{WEBHOOK_PATH}"
     ENABLE_HYBRID_MODE = os.getenv('ENABLE_HYBRID_MODE', 'true').lower() == 'true'
     CHECK_INTERVAL_MINUTES = 10  # Check webhook availability every 10 minutes
     
@@ -6669,11 +6670,9 @@ def main():
                 updater.start_webhook(
                     listen="0.0.0.0",
                     port=WEBHOOK_PORT,
-                    url_path="webhook",
-                    webhook_url=f"{WEBHOOK_URL}/webhook",
-                    allowed_updates=['message', 'callback_query'],
-                    drop_pending_updates=True
+                    url_path="webhook"
                 )
+                updater.bot.setWebhook(f"{WEBHOOK_URL}/webhook")
                 current_mode['mode'] = 'webhook'
                 logger.info(f"✅ WEBHOOK MODE ACTIVE: {WEBHOOK_URL}/webhook")
             except Exception as e:
