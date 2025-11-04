@@ -1,4 +1,4 @@
-﻿"""
+"""
 SVXHUB - Smart Digital SMM Reseller Bot
 A production-ready Telegram bot that connects to Xmedia SMM API
 """
@@ -6669,13 +6669,13 @@ def main():
                 updater.start_webhook(
                     listen="0.0.0.0",
                     port=WEBHOOK_PORT,
-                    url_path=BOT_TOKEN,
-                    webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}",
+                    url_path="webhook",
+                    webhook_url=f"{WEBHOOK_URL}/webhook",
                     allowed_updates=['message', 'callback_query'],
                     drop_pending_updates=True
                 )
                 current_mode['mode'] = 'webhook'
-                logger.info(f"✅ WEBHOOK MODE ACTIVE: {WEBHOOK_URL}/{BOT_TOKEN}")
+                logger.info(f"✅ WEBHOOK MODE ACTIVE: {WEBHOOK_URL}/webhook")
             except Exception as e:
                 logger.error(f"Failed to start webhook: {e}")
                 start_polling_mode()  # Fallback to polling
@@ -6761,7 +6761,7 @@ def main():
         logger.info(f"🔍 Mode monitor active (checking every {CHECK_INTERVAL_MINUTES} minutes)")
     else:
         # Legacy mode - use environment variable
-        USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'false').lower() == 'true'
+        USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'true').lower() == 'true'
         if USE_WEBHOOK:
             start_webhook_mode()
         else:
