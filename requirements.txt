@@ -1,0 +1,12 @@
+# SVXHUB Bot Dependencies
+
+# Pin to v13 LTS to match Updater/Filters API used in code
+python-telegram-bot==13.15
+requests==2.31.0
+python-dotenv==1.0.0
+# PTB 13.15 requires APScheduler==3.6.3
+APScheduler==3.6.3
+Pillow==10.4.0
+easyocr==1.7.1
+razorpay==1.4.2
+pytz==2024.1
