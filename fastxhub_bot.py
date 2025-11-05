@@ -12,6 +12,7 @@ import random
 import string
 import re
 import io
+import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple, List
 from dotenv import load_dotenv
@@ -201,9 +202,13 @@ def extract_text_from_image(image_bytes: bytes) -> str:
             image = image.resize((max_width, new_height), Image.Resampling.LANCZOS)
             logger.info(f"Resized image to {max_width}x{new_height} for faster OCR")
         
+        # Convert PIL Image to numpy array for EasyOCR
+        import numpy as np
+        image_array = np.array(image)
+        
         # SPEED OPTIMIZATION: Use faster OCR settings
         results = reader.readtext(
-            image, 
+            image_array, 
             detail=0, 
             paragraph=False,
             batch_size=1,
@@ -221,12 +226,14 @@ def extract_text_from_image(image_bytes: bytes) -> str:
         
     except Exception as e:
         logger.error(f"Error extracting text from image: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return ""
 
 
 def find_payment_code_in_text(text: str, expected_code: str = None) -> Tuple[bool, Optional[str], str]:
     """
-    Search for payment code in extracted text - OPTIMIZED FOR SPEED
+    Search for payment code in extracted text - OPTIMIZED FOR SPEED with OCR error tolerance
     
     Args:
         text: Extracted text from OCR
@@ -237,10 +244,16 @@ def find_payment_code_in_text(text: str, expected_code: str = None) -> Tuple[boo
     """
     text = text.upper().strip()
     
-    # SPEED OPTIMIZATION: Quick check if expected code exists in text
+    # SPEED OPTIMIZATION: Quick check if expected code exists in text (exact match)
     if expected_code and expected_code.upper() in text:
         logger.info(f"Quick match: Expected code '{expected_code}' found in text")
         return True, expected_code.upper(), "Code found (quick match)"
+    
+    # Helper function to calculate similarity (fuzzy matching for OCR errors)
+    def similarity_ratio(str1: str, str2: str) -> float:
+        """Calculate similarity between two strings (0-100)"""
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, str1.upper(), str2.upper()).ratio() * 100
     
     # Keywords that typically precede payment notes/codes
     keywords = [
@@ -261,16 +274,31 @@ def find_payment_code_in_text(text: str, expected_code: str = None) -> Tuple[boo
         
         if matches:
             for match in matches:
-                # Clean up the extracted code
+                # Clean up the extracted code (remove spaces and common word separators)
                 code = re.sub(r'\s+', '', match.strip())
+                
+                # Extract just the code part (before any trailing words like DATE, TIME, etc.)
+                # Look for patterns like SVXHUB123456 before other words
+                code_pattern = r'([A-Z]{3,}[0-9]{3,})'
+                code_matches = re.findall(code_pattern, code)
+                
+                if code_matches:
+                    # Use the first valid code found
+                    code = code_matches[0]
                 
                 # Validate code format (alphanumeric, 6-20 chars)
                 if 6 <= len(code) <= 20 and code.isalnum():
                     if expected_code:
+                        # Exact match
                         if code == expected_code.upper():
                             return True, code, f"Valid code found after keyword"
+                        # Fuzzy match (OCR errors like 6→G, 0→O, 1→I, etc.)
+                        similarity = similarity_ratio(code, expected_code)
+                        if similarity >= 80:  # 80% similarity threshold (lowered for OCR tolerance)
+                            logger.info(f"Fuzzy match: '{code}' vs '{expected_code}' ({similarity:.1f}% similar)")
+                            return True, expected_code.upper(), f"Code found with {similarity:.0f}% match (OCR tolerant)"
                         else:
-                            logger.info(f"Found code '{code}' but doesn't match expected '{expected_code}'")
+                            logger.info(f"Found code '{code}' but doesn't match expected '{expected_code}' ({similarity:.1f}% similar)")
                     else:
                         return True, code, f"Payment code found"
     
@@ -282,10 +310,22 @@ def find_payment_code_in_text(text: str, expected_code: str = None) -> Tuple[boo
         for code in standalone_matches:
             if 6 <= len(code) <= 20:
                 if expected_code:
+                    # Exact match
                     if code == expected_code.upper():
                         return True, code, f"Valid code found (standalone)"
+                    # Fuzzy match
+                    similarity = similarity_ratio(code, expected_code)
+                    if similarity >= 80:  # 80% similarity threshold
+                        logger.info(f"Fuzzy match (standalone): '{code}' vs '{expected_code}' ({similarity:.1f}% similar)")
+                        return True, expected_code.upper(), f"Code found with {similarity:.0f}% match (standalone)"
                 else:
                     return True, code, f"Payment code found (standalone)"
+    
+    # No valid code found
+    if expected_code:
+        return False, None, f"Code '{expected_code}' not found in receipt"
+    else:
+        return False, None, "No payment code found in receipt"
     
     # No valid code found
     if expected_code:
