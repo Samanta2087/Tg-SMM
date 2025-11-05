@@ -11,13 +11,9 @@ import razorpay
 import random
 import string
 import re
-import io
-import numpy as np
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple, List
 from dotenv import load_dotenv
-from PIL import Image
-import easyocr
 
 from telegram import (
     Update, 
@@ -153,266 +149,6 @@ def safe_edit_message_text(query, text, reply_markup=None, parse_mode='Markdown'
                 query.answer("⚠️ Please try again.", show_alert=False)
             except Exception:
                 pass
-
-
-# ======================== OCR PAYMENT VERIFICATION ========================
-
-# Initialize EasyOCR reader (supports English and numbers)
-ocr_reader = None
-
-def init_ocr_reader():
-    """Initialize OCR reader (lazy loading)"""
-    global ocr_reader
-    if ocr_reader is None:
-        try:
-            ocr_reader = easyocr.Reader(['en'], gpu=False)
-            logger.info("OCR reader initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize OCR reader: {e}")
-            raise
-    return ocr_reader
-
-
-def extract_text_from_image(image_bytes: bytes) -> str:
-    """
-    Extract all text from image using OCR - OPTIMIZED FOR SPEED
-    
-    Args:
-        image_bytes: Image file as bytes
-        
-    Returns:
-        Extracted text as string
-    """
-    try:
-        # Initialize reader if needed
-        reader = init_ocr_reader()
-        
-        # Open image
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to RGB if needed
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-        
-        # SPEED OPTIMIZATION: Resize image if too large (max 1024px width)
-        max_width = 1024
-        if image.width > max_width:
-            ratio = max_width / image.width
-            new_height = int(image.height * ratio)
-            image = image.resize((max_width, new_height), Image.Resampling.LANCZOS)
-            logger.info(f"Resized image to {max_width}x{new_height} for faster OCR")
-        
-        # Convert PIL Image to numpy array for EasyOCR
-        import numpy as np
-        image_array = np.array(image)
-        
-        # SPEED OPTIMIZATION: Use faster OCR settings
-        results = reader.readtext(
-            image_array, 
-            detail=0, 
-            paragraph=False,
-            batch_size=1,
-            contrast_ths=0.3,
-            adjust_contrast=0.7
-        )
-        
-        # Combine all text
-        full_text = ' '.join(results)
-        
-        logger.info(f"OCR extracted text (length: {len(full_text)} chars) in optimized mode")
-        logger.debug(f"OCR extracted text: {full_text[:500]}...")
-        
-        return full_text
-        
-    except Exception as e:
-        logger.error(f"Error extracting text from image: {e}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        return ""
-
-
-def find_payment_code_in_text(text: str, expected_code: str = None) -> Tuple[bool, Optional[str], str]:
-    """
-    Search for payment code in extracted text - OPTIMIZED FOR SPEED with OCR error tolerance
-    
-    Args:
-        text: Extracted text from OCR
-        expected_code: Optional expected code to validate against
-        
-    Returns:
-        Tuple of (found, extracted_code, reason)
-    """
-    text = text.upper().strip()
-    
-    # SPEED OPTIMIZATION: Quick check if expected code exists in text (exact match)
-    if expected_code and expected_code.upper() in text:
-        logger.info(f"Quick match: Expected code '{expected_code}' found in text")
-        return True, expected_code.upper(), "Code found (quick match)"
-    
-    # Helper function to calculate similarity (fuzzy matching for OCR errors)
-    def similarity_ratio(str1: str, str2: str) -> float:
-        """Calculate similarity between two strings (0-100)"""
-        from difflib import SequenceMatcher
-        return SequenceMatcher(None, str1.upper(), str2.upper()).ratio() * 100
-    
-    # Keywords that typically precede payment notes/codes
-    keywords = [
-        r'NOTE[S]?\s*:?\s*',
-        r'REMARK[S]?\s*:?\s*',
-        r'MESSAGE\s*:?\s*',
-        r'DESCRIPTION\s*:?\s*',
-        r'MEMO\s*:?\s*',
-        r'COMMENT\s*:?\s*',
-        r'REF\s*:?\s*',
-        r'REFERENCE\s*:?\s*'
-    ]
-    
-    # Try to find code after keywords
-    for keyword in keywords:
-        pattern = keyword + r'([A-Z0-9\s]{6,30})'
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        
-        if matches:
-            for match in matches:
-                # Clean up the extracted code (remove spaces and common word separators)
-                code = re.sub(r'\s+', '', match.strip())
-                
-                # Extract just the code part (before any trailing words like DATE, TIME, etc.)
-                # Look for patterns like SVXHUB123456 before other words
-                code_pattern = r'([A-Z]{3,}[0-9]{3,})'
-                code_matches = re.findall(code_pattern, code)
-                
-                if code_matches:
-                    # Use the first valid code found
-                    code = code_matches[0]
-                
-                # Validate code format (alphanumeric, 6-20 chars)
-                if 6 <= len(code) <= 20 and code.isalnum():
-                    if expected_code:
-                        # Exact match
-                        if code == expected_code.upper():
-                            return True, code, f"Valid code found after keyword"
-                        # Fuzzy match (OCR errors like 6→G, 0→O, 1→I, etc.)
-                        similarity = similarity_ratio(code, expected_code)
-                        if similarity >= 80:  # 80% similarity threshold (lowered for OCR tolerance)
-                            logger.info(f"Fuzzy match: '{code}' vs '{expected_code}' ({similarity:.1f}% similar)")
-                            return True, expected_code.upper(), f"Code found with {similarity:.0f}% match (OCR tolerant)"
-                        else:
-                            logger.info(f"Found code '{code}' but doesn't match expected '{expected_code}' ({similarity:.1f}% similar)")
-                    else:
-                        return True, code, f"Payment code found"
-    
-    # If no code found after keywords, search for standalone alphanumeric codes
-    standalone_pattern = r'\b([A-Z]{3,10}[0-9]{3,10})\b'
-    standalone_matches = re.findall(standalone_pattern, text)
-    
-    if standalone_matches:
-        for code in standalone_matches:
-            if 6 <= len(code) <= 20:
-                if expected_code:
-                    # Exact match
-                    if code == expected_code.upper():
-                        return True, code, f"Valid code found (standalone)"
-                    # Fuzzy match
-                    similarity = similarity_ratio(code, expected_code)
-                    if similarity >= 80:  # 80% similarity threshold
-                        logger.info(f"Fuzzy match (standalone): '{code}' vs '{expected_code}' ({similarity:.1f}% similar)")
-                        return True, expected_code.upper(), f"Code found with {similarity:.0f}% match (standalone)"
-                else:
-                    return True, code, f"Payment code found (standalone)"
-    
-    # No valid code found
-    if expected_code:
-        return False, None, f"Code '{expected_code}' not found in receipt"
-    else:
-        return False, None, "No payment code found in receipt"
-    
-    # No valid code found
-    if expected_code:
-        return False, None, f"Expected code '{expected_code}' not found in receipt"
-    else:
-        return False, None, "No payment code found in receipt"
-
-
-def verify_payment_receipt(image_bytes: bytes, expected_code: str = None, 
-                          min_amount: float = None, utr_number: str = None) -> Dict:
-    """
-    Main verification function - scans receipt and validates payment
-    
-    Args:
-        image_bytes: Payment receipt image as bytes
-        expected_code: Expected payment verification code (optional)
-        min_amount: Minimum amount that should be in receipt (optional)
-        utr_number: UTR number to search for (optional)
-        
-    Returns:
-        Dictionary with verification results
-    """
-    try:
-        # Extract text from image
-        extracted_text = extract_text_from_image(image_bytes)
-        
-        if not extracted_text:
-            return {
-                'verified': False,
-                'code_found': None,
-                'amount_found': None,
-                'utr_found': False,
-                'reason': 'Failed to extract text from image',
-                'extracted_text': ''
-            }
-        
-        # Search for payment code
-        code_verified, found_code, code_reason = find_payment_code_in_text(extracted_text, expected_code)
-        
-        # Search for amount (optional)
-        amount_found = None
-        if min_amount:
-            amount_pattern = r'[\u20B9]?\s*(\d{1,5}(?:\.\d{2})?)'
-            amounts = re.findall(amount_pattern, extracted_text)
-            
-            if amounts:
-                # Convert to floats and find largest
-                float_amounts = [float(a) for a in amounts if float(a) >= min_amount]
-                if float_amounts:
-                    amount_found = max(float_amounts)
-        
-        # Search for UTR (optional)
-        utr_verified = False
-        if utr_number:
-            utr_pattern = re.escape(utr_number.upper())
-            if re.search(utr_pattern, extracted_text.upper()):
-                utr_verified = True
-        
-        # Overall verification
-        verified = code_verified
-        if min_amount and not amount_found:
-            verified = False
-            code_reason += f" | Amount ₹{min_amount} not found"
-        
-        if utr_number and not utr_verified:
-            verified = False
-            code_reason += f" | UTR {utr_number} not found"
-        
-        return {
-            'verified': verified,
-            'code_found': found_code,
-            'amount_found': amount_found,
-            'utr_found': utr_verified if utr_number else None,
-            'reason': code_reason,
-            'extracted_text': extracted_text[:1000]
-        }
-        
-    except Exception as e:
-        logger.error(f"Error verifying payment receipt: {e}")
-        return {
-            'verified': False,
-            'code_found': None,
-            'amount_found': None,
-            'utr_found': False,
-            'reason': f'Verification error: {str(e)}',
-            'extracted_text': ''
-        }
 
 
 # ======================== RATE LIMITING ========================
@@ -1840,12 +1576,6 @@ def button_handler(update: Update, context: CallbackContext) -> Optional[int]:
     elif data == 'menu_referral':
         show_referral_menu(query, user_id, context)
     elif data == 'upload_payment':
-        # Generate unique payment verification code
-        payment_code = generate_payment_code(user_id)
-        
-        # Store payment code in context for later use
-        context.user_data['payment_code'] = payment_code
-        
         # Get UPI details from database
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1866,14 +1596,6 @@ def button_handler(update: Update, context: CallbackContext) -> Optional[int]:
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🔐 **IMPORTANT - Your Verification Code:**
-
-`{payment_code}` (tap to copy)
-
-⚠️ You MUST include this code in the payment notes/remarks field when making the UPI payment. This is required for automatic verification.
-
-━━━━━━━━━━━━━━━━━━━━
-
 📱 UPI Payment Details:
 UPI ID: `{upi_id}` (tap to copy)
 Name: {upi_name}
@@ -1889,7 +1611,7 @@ Please enter the amount you want to add:
 Example: 500
 
 (Enter amount in numbers only)
-After entering amount, you'll upload payment screenshot with the verification code visible.
+After entering amount, you'll upload payment screenshot.
 """
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data='back_to_main')]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -4870,166 +4592,37 @@ def handle_utr_number(update: Update, context: CallbackContext) -> int:
     conn.commit()
     conn.close()
     
-    # Store pending_id for OCR verification
-    context.user_data['pending_payment_id'] = pending_id
+    # Get user info
+    user_info = get_user_info(user.id)
     
-    # DO NOT notify admin yet - wait for OCR verification
-    user_info = get_user_info(user.id)  # Get user info for later use
-    
+    # Notify user - payment submitted successfully
     update.message.reply_text(
-        "✅ Your fund request has been submitted!\n\n"
-        f"Amount: ₹{amount:.2f}\n"
-        f"UTR: {utr_number}\n"
-        f"Code: {payment_code}\n\n"
-        "⏳ Verifying payment automatically..."
+        f"✅ **Payment Request Submitted!**\n\n"
+        f"Your payment has been submitted for review.\n\n"
+        f"💰 Amount: ₹{amount:.2f}\n"
+        f"🔑 Code: {payment_code}\n"
+        f"� UTR: {utr_number}\n\n"
+        f"⏳ Waiting for admin approval...\n"
+        f"You'll be notified once approved! 🙏",
+        parse_mode='Markdown'
     )
     
-    # Perform OCR verification with timeout
-    import time
-    start_time = time.time()
-    
+    # Notify admin immediately
     try:
-        # Show animated scanning progress
-        scanning_msg = update.message.reply_text(
-            "🔄 **Scanning your payment receipt...**\n\n"
-            "▰▰▰▱▱▱▱▱▱▱ 30%\n\n"
-            "Please wait...",
+        context.bot.send_photo(
+            chat_id=ADMIN_ID,
+            photo=photo_file_id,
+            caption=f"💰 **New Payment Request**\n\n"
+                    f"User: @{user_info['username']} ({user.id})\n"
+                    f"Amount: ₹{amount:.2f}\n"
+                    f"UTR: {utr_number}\n\n"
+                    f"📅 Requested: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"Use /credit {user.id} {amount} to approve.",
             parse_mode='Markdown'
         )
-        
-        # Download the payment screenshot (fast operation)
-        photo_file = context.bot.get_file(photo_file_id)
-        photo_bytes = photo_file.download_as_bytearray()
-        
-        # Update progress
-        try:
-            scanning_msg.edit_text(
-                "🔄 **Scanning your payment receipt...**\n\n"
-                "▰▰▰▰▰▰▱▱▱▱ 60%\n\n"
-                "Analyzing receipt details...",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
-        
-        # Verify payment receipt using OCR
-        logger.info(f"Starting OCR verification for user {user.id}, code: {payment_code}")
-        verification_result = verify_payment_receipt(
-            image_bytes=bytes(photo_bytes),
-            expected_code=payment_code,
-            min_amount=amount,
-            utr_number=utr_number
-        )
-        
-        # Update progress to complete
-        try:
-            scanning_msg.edit_text(
-                "✅ **Scanning Complete!**\n\n"
-                "▰▰▰▰▰▰▰▰▰▰ 100%\n\n"
-                "Processing results...",
-                parse_mode='Markdown'
-            )
-        except:
-            pass
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"OCR verification completed in {elapsed_time:.2f} seconds for user {user.id}: {verification_result}")
-        
-        if verification_result['verified']:
-            # OCR VERIFIED - Do NOT auto-credit, send to admin for approval
-            
-            # Delete scanning animation message
-            try:
-                scanning_msg.delete()
-            except:
-                pass
-            
-            # Notify user - payment is verified and sent to admin
-            update.message.reply_text(
-                f"✅ **PAYMENT VERIFIED!**\n\n"
-                f"Your payment code has been verified successfully!\n\n"
-                f"💰 Amount: ₹{amount:.2f}\n"
-                f"✓ Verification Code Matched: {payment_code}\n"
-                f"✓ Sent to admin for approval\n\n"
-                f"You'll be notified once approved! 🙏",
-                parse_mode='Markdown'
-            )
-            
-            # Send to admin with verification success
-            try:
-                context.bot.send_photo(
-                    chat_id=ADMIN_ID,
-                    photo=photo_file_id,
-                    caption=f"✅ **OCR VERIFIED** Payment Request\n\n"
-                            f"User: @{user_info['username']} ({user.id})\n"
-                            f"Amount: ₹{amount:.2f}\n"
-                            f"Code: {payment_code} ✓ MATCHED\n"
-                            f"UTR: {utr_number}\n\n"
-                            f"✓ OCR verification successful\n"
-                            f"✓ Code found in receipt\n"
-                            f"✓ Verified in {elapsed_time:.1f}s\n\n"
-                            f"Use /credit {user.id} {amount} to approve.",
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify admin: {e}")
-                
-        else:
-            # Delete scanning animation message
-            try:
-                scanning_msg.delete()
-            except:
-                pass
-            
-            # Auto-reject or flag for manual review
-            reason = verification_result.get('reason', 'Unknown error')
-            
-            # Update status to rejected
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE pending_funds SET status = 'rejected' WHERE id = ?",
-                (pending_id,)
-            )
-            conn.commit()
-            conn.close()
-            
-            # Notify user
-            update.message.reply_text(
-                f"❌ **PAYMENT VERIFICATION FAILED**\n\n"
-                f"Reason: {reason}\n\n"
-                f"⚠️ Please ensure:\n"
-                f"• You included code **{payment_code}** in payment notes/remarks\n"
-                f"• The code is clearly visible in the screenshot\n"
-                f"• Amount matches: ₹{amount:.2f}\n"
-                f"• UTR number is correct: {utr_number}\n\n"
-                f"Please try again with /addfund or contact support.",
-                parse_mode='Markdown'
-            )
-            
-            # DO NOT notify admin for rejected payments
-            logger.info(f"Payment rejected for user {user.id}: {reason}")
-                
-    except Exception as ocr_error:
-        logger.error(f"OCR verification failed with exception: {ocr_error}")
-        
-        # Delete scanning animation message
-        try:
-            scanning_msg.delete()
-        except:
-            pass
-        
-        # Do not auto-reject on OCR errors, leave for manual review
-        update.message.reply_text(
-            "⚠️ **Automatic verification unavailable**\n\n"
-            "Your payment is pending manual review by admin.\n"
-            "You will be notified once approved.\n\n"
-            "Thank you for your patience! 🙏",
-            parse_mode='Markdown'
-        )
-        
-        # DO NOT notify admin for OCR errors - payment already in database as pending
-        logger.info(f"OCR error for user {user.id}, payment left as pending")
+        logger.info(f"Payment request sent to admin for user {user.id}, amount: {amount}")
+    except Exception as e:
+        logger.error(f"Failed to notify admin: {e}")
     
     return ConversationHandler.END
 
@@ -5055,7 +4648,7 @@ def handle_payment_amount(update: Update, context: CallbackContext) -> int:
     # Store amount
     context.user_data['payment_amount'] = amount
     
-    # Get payment code from context (generated when user clicked upload_payment)
+    # Get UPI details from database
     payment_code = context.user_data.get('payment_code', 'CODE_ERROR')
 
     # Get UPI details from database
@@ -5079,27 +4672,13 @@ def handle_payment_amount(update: Update, context: CallbackContext) -> int:
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🔐 **VERIFICATION CODE:**
-`{payment_code}` (tap to copy)
-
-⚠️ **CRITICAL:** Include this code in payment notes/remarks/description field!
-
 ━━━━━━━━━━━━━━━━━━━━
 
 📱 Step 2/3: Complete Payment
-
-Please pay ₹{amount:.2f} to:
-
-💳 UPI ID: `{upi_id}` (tap to copy)
-👤 Name: {upi_name}
-
-
-
 After payment, upload your payment screenshot below.
 
  Make sure screenshot shows:
     Transaction amount
-    Verification code in notes/remarks: **{payment_code}**
     UPI Reference/UTR number
     Payment success status
 """
