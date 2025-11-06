@@ -350,6 +350,41 @@ def init_database():
         )
     ''')
     
+    # User verification table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_verification (
+            user_id INTEGER PRIMARY KEY,
+            is_verified INTEGER DEFAULT 0,
+            verification_code INTEGER,
+            verification_attempts INTEGER DEFAULT 0,
+            country_code TEXT,
+            language_code TEXT,
+            verification_date TEXT,
+            ip_address TEXT,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    ''')
+    
+    # Blocked regions table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_regions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country_code TEXT UNIQUE,
+            region_name TEXT,
+            blocked_date TEXT
+        )
+    ''')
+    
+    # Allowed regions table (whitelist)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS allowed_regions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country_code TEXT UNIQUE,
+            region_name TEXT,
+            added_date TEXT
+        )
+    ''')
+    
     # Support tickets tracking table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS support_tickets (
@@ -613,6 +648,166 @@ def set_setting(key: str, value: str) -> None:
     conn.commit()
     conn.close()
     logger.info(f"Setting updated: {key} = {value}")
+
+
+# ======================== VERIFICATION & REGION VALIDATION ========================
+
+def get_user_verification_status(user_id: int) -> Dict:
+    """Get user verification status"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM user_verification WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return {
+            'user_id': row[0],
+            'is_verified': row[1],
+            'verification_code': row[2],
+            'verification_attempts': row[3],
+            'country_code': row[4],
+            'language_code': row[5],
+            'verification_date': row[6],
+            'ip_address': row[7]
+        }
+    return None
+
+
+def is_user_verified(user_id: int) -> bool:
+    """Check if user is verified"""
+    status = get_user_verification_status(user_id)
+    return status and status['is_verified'] == 1
+
+
+def is_region_allowed(country_code: str, language_code: str = None) -> Tuple[bool, str]:
+    """Check if user's region is allowed
+    Returns: (is_allowed, reason)
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Check if there are any allowed regions set (whitelist mode)
+    cursor.execute('SELECT COUNT(*) FROM allowed_regions')
+    allowed_count = cursor.fetchone()[0]
+    
+    if allowed_count > 0:
+        # Whitelist mode - only allowed regions can access
+        cursor.execute('SELECT region_name FROM allowed_regions WHERE country_code = ?', (country_code,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            return True, f"Welcome from {result[0]}!"
+        else:
+            return False, f"Sorry, service is not available in your region ({country_code}). Only available in India."
+    
+    # Check if region is blocked
+    cursor.execute('SELECT region_name FROM blocked_regions WHERE country_code = ?', (country_code,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return False, f"Sorry, service is not available in {result[0]}."
+    
+    return True, "Region allowed"
+
+
+def generate_verification_code() -> int:
+    """Generate a random 4-digit verification code"""
+    return random.randint(1000, 9999)
+
+
+def create_verification_challenge(user_id: int, country_code: str = None, language_code: str = None, ip_address: str = None) -> int:
+    """Create verification challenge for user"""
+    code = generate_verification_code()
+    
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR REPLACE INTO user_verification 
+        (user_id, is_verified, verification_code, verification_attempts, country_code, language_code, ip_address)
+        VALUES (?, 0, ?, 0, ?, ?, ?)
+    ''', (user_id, code, country_code, language_code, ip_address))
+    conn.commit()
+    conn.close()
+    
+    return code
+
+
+def verify_user_code(user_id: int, code: int) -> Tuple[bool, str]:
+    """Verify user's code
+    Returns: (success, message)
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT verification_code, verification_attempts FROM user_verification WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    
+    if not result:
+        conn.close()
+        return False, "Verification not found. Please start again with /start"
+    
+    stored_code, attempts = result
+    
+    if attempts >= 3:
+        # Block user after 3 failed attempts
+        cursor.execute('UPDATE users SET is_blocked = 1, block_reason = ? WHERE id = ?', 
+                      ('Too many failed verification attempts', user_id))
+        conn.commit()
+        conn.close()
+        return False, "Too many failed attempts. Your account has been blocked."
+    
+    if code == stored_code:
+        # Success!
+        cursor.execute('''
+            UPDATE user_verification 
+            SET is_verified = 1, verification_date = ?
+            WHERE user_id = ?
+        ''', (datetime.now().isoformat(), user_id))
+        conn.commit()
+        conn.close()
+        return True, "✅ Verification successful! Welcome to SVXHUB!"
+    else:
+        # Wrong code
+        new_attempts = attempts + 1
+        cursor.execute('UPDATE user_verification SET verification_attempts = ? WHERE user_id = ?', 
+                      (new_attempts, user_id))
+        conn.commit()
+        conn.close()
+        return False, f"❌ Wrong code. Attempts left: {3 - new_attempts}"
+
+
+def add_allowed_region(country_code: str, region_name: str) -> bool:
+    """Add region to whitelist"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO allowed_regions (country_code, region_name, added_date)
+            VALUES (?, ?, ?)
+        ''', (country_code, region_name, datetime.now().isoformat()))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to add allowed region: {e}")
+        return False
+
+
+def remove_allowed_region(country_code: str) -> bool:
+    """Remove region from whitelist"""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM allowed_regions WHERE country_code = ?', (country_code,))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to remove allowed region: {e}")
+        return False
 
 
 # ======================== RAZORPAY HELPERS ========================
@@ -1369,7 +1564,7 @@ def refund_order(order_id: int) -> Dict[str, Any]:
 # ======================== BOT HANDLERS ========================
 
 def start(update: Update, context: CallbackContext) -> None:
-    """Handle /start command"""
+    """Handle /start command with human verification and region validation"""
     user = update.effective_user
     
     # Extract referral code from deep link
@@ -1379,6 +1574,18 @@ def start(update: Update, context: CallbackContext) -> None:
             referrer_id = int(context.args[0])
         except ValueError:
             pass
+    
+    # Get user metadata from Telegram
+    country_code = None
+    language_code = user.language_code or 'en'
+    
+    # Try to extract country from language code (e.g., en-IN -> IN)
+    if language_code and '-' in language_code:
+        country_code = language_code.split('-')[1].upper()
+    
+    # Default to India if no country detected
+    if not country_code:
+        country_code = 'IN'  # Default to India
     
     # Check if user is blocked - show limited menu with only support
     if is_user_blocked(user.id):
@@ -1419,6 +1626,64 @@ You can still reach our support team!
             blocked_text,
             reply_markup=reply_markup
         )
+        return
+    
+    # Region validation (skip for admin)
+    if not is_admin(user.id):
+        allowed, reason = is_region_allowed(country_code, language_code)
+        if not allowed:
+            update.message.reply_text(
+                f"🚫 **Access Denied**\n\n"
+                f"{reason}\n\n"
+                f"Region Code: {country_code}\n"
+                f"Language: {language_code}\n\n"
+                f"If you believe this is a mistake, please contact support.",
+                parse_mode='Markdown'
+            )
+            # Log blocked access attempt
+            logger.warning(f"Blocked access from user {user.id} ({user.username}) - Region: {country_code}")
+            return
+    
+    # Check if user needs human verification (skip for admin)
+    if not is_admin(user.id) and not is_user_verified(user.id):
+        # Create verification challenge
+        code = create_verification_challenge(user.id, country_code, language_code)
+        
+        # Simple math challenge as additional verification
+        num1 = random.randint(1, 10)
+        num2 = random.randint(1, 10)
+        answer = num1 + num2
+        
+        # Store math answer in context for verification
+        context.user_data['verification_math_answer'] = answer
+        context.user_data['verification_code'] = code
+        context.user_data['awaiting_verification'] = True
+        
+        verification_text = f"""
+🔐 **HUMAN VERIFICATION REQUIRED**
+
+Welcome to SVXHUB! To ensure you're a real human and not a bot, please complete this quick verification:
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Step 1:** Solve this simple math problem:
+❓ What is {num1} + {num2} = ?
+
+**Step 2:** Add your answer to this code:
+🔢 {code}
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Example:**
+If the answer is 7, type: {code}7
+
+**Your answer:**
+Type your response below ⬇️
+
+⚠️ You have 3 attempts only!
+"""
+        
+        update.message.reply_text(verification_text, parse_mode='Markdown')
         return
     
     # Apply rate limiting (except for admins)
@@ -1524,6 +1789,75 @@ Welcome back, {user.first_name}! ✨
         welcome_text,
         reply_markup=reply_markup
     )
+
+
+def handle_verification_response(update: Update, context: CallbackContext) -> None:
+    """Handle verification code response from user"""
+    user = update.effective_user
+    
+    # Check if user is awaiting verification
+    if not context.user_data.get('awaiting_verification'):
+        return  # Not awaiting verification, let other handlers process
+    
+    try:
+        user_response = update.message.text.strip()
+        expected_code = context.user_data.get('verification_code')
+        expected_answer = context.user_data.get('verification_math_answer')
+        
+        # Expected format: CODE + ANSWER (e.g., 12347)
+        if not user_response.isdigit() or len(user_response) < 5:
+            update.message.reply_text(
+                "❌ Invalid format!\n\n"
+                "Please type the verification code followed by your math answer.\n"
+                "Example: If code is 1234 and answer is 7, type: 12347"
+            )
+            return
+        
+        # Split the response
+        code_part = int(user_response[:-1])
+        answer_part = int(user_response[-1])
+        
+        # Verify code
+        if code_part != expected_code:
+            update.message.reply_text(
+                "❌ Wrong verification code!\n\n"
+                "Please check and try again."
+            )
+            return
+        
+        # Verify math answer
+        if answer_part != expected_answer:
+            update.message.reply_text(
+                f"❌ Wrong math answer!\n\n"
+                f"Please solve the math problem correctly."
+            )
+            return
+        
+        # Both correct - verify user
+        success, message = verify_user_code(user.id, expected_code)
+        
+        if success:
+            # Clear verification data
+            context.user_data['awaiting_verification'] = False
+            context.user_data.pop('verification_code', None)
+            context.user_data.pop('verification_math_answer', None)
+            
+            update.message.reply_text(
+                f"✅ **Verification Successful!**\n\n"
+                f"{message}\n\n"
+                f"You can now use all bot features!\n\n"
+                f"Type /start to begin.",
+                parse_mode='Markdown'
+            )
+        else:
+            update.message.reply_text(message)
+            
+    except (ValueError, IndexError):
+        update.message.reply_text(
+            "❌ Invalid response!\n\n"
+            "Please type the verification code followed by your answer.\n"
+            "Example: If code is 1234 and answer is 7, type: 12347"
+        )
 
 
 def button_handler(update: Update, context: CallbackContext) -> Optional[int]:
@@ -6097,6 +6431,13 @@ def main():
     # Register handlers
     dp.add_handler(CommandHandler('start', start))
     
+    # Verification handler (must be before conversation handler)
+    dp.add_handler(MessageHandler(
+        Filters.text & ~Filters.command, 
+        handle_verification_response, 
+        pass_user_data=True
+    ))
+    
     # Admin commands only (wallet control now button-based via admin panel)
     dp.add_handler(CommandHandler('refund', refund_command))
     dp.add_handler(CommandHandler('reply', reply_command))
@@ -6186,6 +6527,20 @@ def main():
     # Error handler
     dp.add_error_handler(error_handler)
     
+    # Initialize default allowed region (India only)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM allowed_regions')
+    if cursor.fetchone()[0] == 0:
+        # Add India as default allowed region
+        cursor.execute('''
+            INSERT OR IGNORE INTO allowed_regions (country_code, region_name, added_date)
+            VALUES ('IN', 'India', ?)
+        ''', (datetime.now().isoformat(),))
+        conn.commit()
+        logger.info("✅ India added to allowed regions (whitelist mode activated)")
+    conn.close()
+    
     # Setup scheduler for service sync
     from pytz import utc
     scheduler = BackgroundScheduler(timezone=utc)
@@ -6236,156 +6591,58 @@ def main():
     import threading
     import socket
     
-    # Webhook configuration
-    WEBHOOK_PORT = int(os.getenv('PORT', os.getenv('WEBHOOK_PORT', '8443')))
+    # Webhook configuration (PURE WEBHOOK MODE - No polling fallback)
+    # Telegram only allows ports: 80, 88, 443, or 8443
+    # Force 8443 as it's the most commonly used secure port for Telegram webhooks
+    WEBHOOK_PORT = 8443
     WEBHOOK_PATH = "webhook"
-    WEBHOOK_URL = f"https://slvk.shop:{WEBHOOK_PORT}/{WEBHOOK_PATH}"
-    ENABLE_HYBRID_MODE = os.getenv('ENABLE_HYBRID_MODE', 'true').lower() == 'true'
+    # Don't include port 8443 in URL as it's understood by Telegram
+    WEBHOOK_URL = f"https://slvk.shop/{WEBHOOK_PATH}"
+    ENABLE_HYBRID_MODE = False  # Disabled - use webhook only
     CHECK_INTERVAL_MINUTES = 10  # Check webhook availability every 10 minutes
     
-    current_mode = {'mode': None, 'lock': threading.Lock()}  # Track current mode
+    # Bot mode configuration
+    # Use POLLING for local testing, WEBHOOK for production VPS
+    USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'true').lower() == 'true'
+    logger.info(f"🔍 USE_WEBHOOK environment variable: {os.getenv('USE_WEBHOOK', 'true')}")
+    logger.info(f"🔍 USE_WEBHOOK final value: {USE_WEBHOOK}")
     
-    def is_webhook_reachable(url: str, timeout: int = 5) -> bool:
-        """Check if webhook URL is reachable via HTTP HEAD request"""
+    if USE_WEBHOOK:
+        # Start webhook mode (for production VPS with SSL)
+        logger.info("🚀 Starting WEBHOOK MODE")
+        logger.info(f"📍 Webhook URL: {WEBHOOK_URL}")
+        logger.info(f"🔌 Port: {WEBHOOK_PORT}")
+        
         try:
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            host = parsed.hostname
-            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-            
-            # Quick TCP socket check (faster than HTTP request)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((host, port))
-            sock.close()
-            
-            if result == 0:
-                # Host is reachable, do a quick HTTP check
-                import requests
-                response = requests.head(url, timeout=timeout, allow_redirects=True)
-                return response.status_code < 500  # Accept any non-server-error
-            return False
+            updater.start_webhook(
+                listen="0.0.0.0",
+                port=WEBHOOK_PORT,
+                url_path=WEBHOOK_PATH,
+                webhook_url=WEBHOOK_URL,
+                drop_pending_updates=True,
+                allowed_updates=['message', 'callback_query']
+            )
+            logger.info("✅ WEBHOOK MODE ACTIVE")
         except Exception as e:
-            logger.debug(f"Webhook check failed: {e}")
-            return False
+            logger.error(f"❌ Failed to start webhook: {e}")
+            logger.error("Falling back to POLLING mode...")
+            USE_WEBHOOK = False
     
-    def start_webhook_mode():
-        """Start bot in webhook mode"""
-        with current_mode['lock']:
-            if current_mode['mode'] == 'webhook':
-                return  # Already in webhook mode
-            
-            # Stop polling if running
-            if current_mode['mode'] == 'polling':
-                try:
-                    updater.stop()
-                    logger.info("🔄 Stopped polling mode")
-                except:
-                    pass
-            
-            # Start webhook
-            try:
-                logger.info(f"🌐 Starting WEBHOOK mode on port {WEBHOOK_PORT}...")
-                updater.start_webhook(
-                    listen="0.0.0.0",
-                    port=WEBHOOK_PORT,
-                    url_path="webhook"
-                )
-                updater.bot.setWebhook(f"{WEBHOOK_URL}/webhook")
-                current_mode['mode'] = 'webhook'
-                logger.info(f"✅ WEBHOOK MODE ACTIVE: {WEBHOOK_URL}/webhook")
-            except Exception as e:
-                logger.error(f"Failed to start webhook: {e}")
-                start_polling_mode()  # Fallback to polling
+    if not USE_WEBHOOK:
+        # Start polling mode (for local testing)
+        logger.info("📡 Starting POLLING MODE (local testing)")
+        try:
+            updater.start_polling(
+                timeout=30,
+                drop_pending_updates=True,
+                allowed_updates=['message', 'callback_query']
+            )
+            logger.info("✅ POLLING MODE ACTIVE - Bot is ready!")
+        except Exception as e:
+            logger.error(f"❌ Failed to start polling: {e}")
+            raise
     
-    def start_polling_mode():
-        """Start bot in polling mode"""
-        with current_mode['lock']:
-            if current_mode['mode'] == 'polling':
-                return  # Already in polling mode
-            
-            # Stop webhook if running
-            if current_mode['mode'] == 'webhook':
-                try:
-                    updater.stop()
-                    logger.info("🔄 Stopped webhook mode")
-                except:
-                    pass
-            
-            # Start polling
-            try:
-                logger.info("📡 Starting POLLING mode...")
-                updater.start_polling(
-                    timeout=30,
-                    drop_pending_updates=True,
-                    allowed_updates=['message', 'callback_query']
-                )
-                current_mode['mode'] = 'polling'
-                logger.info("✅ POLLING MODE ACTIVE")
-            except Exception as e:
-                logger.error(f"Failed to start polling: {e}")
-                # Retry with exponential backoff
-                import time
-                for attempt in range(3):
-                    time.sleep(2 ** attempt)
-                    try:
-                        updater.start_polling(
-                            timeout=30,
-                            drop_pending_updates=True,
-                            allowed_updates=['message', 'callback_query']
-                        )
-                        current_mode['mode'] = 'polling'
-                        logger.info("✅ POLLING MODE ACTIVE (after retry)")
-                        break
-                    except:
-                        continue
-    
-    def check_and_switch_mode():
-        """Periodically check webhook availability and switch modes"""
-        while True:
-            try:
-                import time
-                time.sleep(CHECK_INTERVAL_MINUTES * 60)  # Wait 10 minutes
-                
-                webhook_available = is_webhook_reachable(WEBHOOK_URL)
-                
-                with current_mode['lock']:
-                    if webhook_available and current_mode['mode'] != 'webhook':
-                        logger.info("🔄 Webhook is now reachable, switching to WEBHOOK mode...")
-                        start_webhook_mode()
-                    elif not webhook_available and current_mode['mode'] != 'polling':
-                        logger.info("🔄 Webhook unreachable, switching to POLLING mode...")
-                        start_polling_mode()
-                    else:
-                        logger.debug(f"✓ Mode check: {current_mode['mode'].upper()} mode still optimal")
-            except Exception as e:
-                logger.error(f"Error in mode checker: {e}")
-    
-    # Initial mode selection
-    if ENABLE_HYBRID_MODE:
-        logger.info("🔀 HYBRID MODE ENABLED - Auto-switching between webhook and polling")
-        
-        # Check if webhook is reachable
-        if is_webhook_reachable(WEBHOOK_URL):
-            logger.info("✓ Webhook URL is reachable")
-            start_webhook_mode()
-        else:
-            logger.info("✗ Webhook URL not reachable, using polling")
-            start_polling_mode()
-        
-        # Start background thread to monitor and switch modes
-        monitor_thread = threading.Thread(target=check_and_switch_mode, daemon=True)
-        monitor_thread.start()
-        logger.info(f"🔍 Mode monitor active (checking every {CHECK_INTERVAL_MINUTES} minutes)")
-    else:
-        # Legacy mode - use environment variable
-        USE_WEBHOOK = os.getenv('USE_WEBHOOK', 'true').lower() == 'true'
-        if USE_WEBHOOK:
-            start_webhook_mode()
-        else:
-            start_polling_mode()
-    
-    # Keep bot running and handle connection errors gracefully
+    # Keep bot running
     try:
         updater.idle()
     except KeyboardInterrupt:
@@ -6393,6 +6650,7 @@ def main():
     except Exception as e:
         logger.error(f"Bot idle error: {e}")
         logger.info("Bot continues running with scheduler...")
+
     
     # Shutdown scheduler
     scheduler.shutdown()
